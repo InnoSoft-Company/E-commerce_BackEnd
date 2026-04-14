@@ -38,9 +38,6 @@ class Product(models.Model):
     category    = models.ForeignKey(Category, on_delete=models.SET_NULL, null=True, related_name="products")
     image       = models.URLField(max_length=500, blank=True, null=True)
     description = models.TextField(blank=True)
-    sizes       = models.JSONField(default=list)
-    colors      = models.JSONField(default=list)
-    images      = models.JSONField(default=list)
     rating      = models.FloatField(default=0.0)
     reviews     = models.PositiveIntegerField(default=0)
     in_stock    = models.BooleanField(default=True)
@@ -51,6 +48,95 @@ class Product(models.Model):
 
     def __str__(self):
         return self.name
+
+    @property
+    def has_variants(self):
+        """True if this product uses the new variant system."""
+        return self.variants.exists()
+
+    @property
+    def is_available(self):
+        """
+        A product is available if:
+        - It has no variants -> fall back to legacy in_stock field
+        - It has variants -> at least one variant has stock > 0
+        """
+        if self.has_variants:
+            return self.variants.filter(stock__gt=0).exists()
+        return self.in_stock
+
+    def sync_in_stock(self):
+        """Keep the legacy in_stock field in sync with variant availability."""
+        if self.has_variants:
+            self.in_stock = self.variants.filter(stock__gt=0).exists()
+            Product.objects.filter(pk=self.pk).update(in_stock=self.in_stock)
+
+
+# ── ProductVariant (Color) ─────────────────────────
+# Represents one COLOR of a product. Each color has its own image
+# and multiple sizes, each size with its own stock quantity.
+class ProductVariant(models.Model):
+    product   = models.ForeignKey(Product, on_delete=models.CASCADE, related_name="variants")
+    color     = models.CharField(max_length=100, verbose_name="اللون")
+    color_hex = models.CharField(
+        max_length=7, blank=True, default="",
+        help_text="كود اللون hex مثل #FF0000 (اختياري)",
+        verbose_name="كود اللون"
+    )
+    image     = models.CharField(max_length=500, blank=True, default="", verbose_name="صورة اللون")
+    # Total stock across all sizes — computed & stored for quick filtering
+    stock     = models.PositiveIntegerField(default=0, verbose_name="المخزون الكلي")
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        unique_together     = ("product", "color")
+        verbose_name        = "متغير المنتج (لون)"
+        verbose_name_plural = "متغيرات المنتج (ألوان)"
+        ordering            = ["color"]
+
+    def __str__(self):
+        return f"{self.product.name} — {self.color}"
+
+    def recalculate_stock(self):
+        """Sum up all size quantities and save total stock."""
+        from django.db.models import Sum
+        total = self.sizes.aggregate(total=Sum("quantity"))["total"] or 0
+        self.stock = total
+        ProductVariant.objects.filter(pk=self.pk).update(stock=total)
+        # Keep parent product in_stock in sync
+        self.product.sync_in_stock()
+
+
+# ── ProductSize ───────────────────────────────────
+# Represents one SIZE inside a color variant. Each has its own quantity.
+class ProductSize(models.Model):
+    variant  = models.ForeignKey(ProductVariant, on_delete=models.CASCADE, related_name="sizes")
+    size     = models.CharField(max_length=50, verbose_name="المقاس")
+    quantity = models.PositiveIntegerField(default=0, verbose_name="الكمية")
+
+    class Meta:
+        unique_together     = ("variant", "size")
+        verbose_name        = "مقاس"
+        verbose_name_plural = "مقاسات"
+        ordering            = ["size"]
+
+    def __str__(self):
+        return f"{self.variant} / {self.size} ({self.quantity})"
+
+    def reduce_stock(self, qty: int):
+        """
+        Decrease quantity by qty. Raises ValueError if not enough stock.
+        After reducing, recalculates the parent variant's total stock.
+        """
+        if self.quantity < qty:
+            raise ValueError(
+                f"الكمية المطلوبة ({qty}) أكبر من المتاح ({self.quantity}) "
+                f"للمقاس {self.size} اللون {self.variant.color}"
+            )
+        self.quantity -= qty
+        ProductSize.objects.filter(pk=self.pk).update(quantity=self.quantity)
+        self.variant.recalculate_stock()
 
 
 # ── Coupon ────────────────────────────────────────
@@ -72,9 +158,6 @@ class Coupon(models.Model):
 
 # ── ShippingZone ──────────────────────────────────
 class ShippingZone(models.Model):
-    """
-    الأدمين يضيف المحافظات وأسعار الشحن من هنا.
-    """
     governorate = models.CharField(max_length=100, unique=True, verbose_name="المحافظة")
     fee         = models.DecimalField(max_digits=8, decimal_places=2, verbose_name="سعر الشحن")
     enabled     = models.BooleanField(default=True, verbose_name="متاح")
@@ -149,10 +232,6 @@ class OrderItem(models.Model):
 
 # ── Cart Items ────────────────────────────────────
 class CartItem(models.Model):
-    """
-    عناصر السلة الخاصة بكل مستخدم
-    محفوظة في الداتابيس ليتمكن من الوصول إليها من أي جهاز
-    """
     user     = models.ForeignKey(User, on_delete=models.CASCADE, related_name="cart_items")
     product  = models.ForeignKey(Product, on_delete=models.CASCADE)
     quantity = models.PositiveIntegerField(default=1)

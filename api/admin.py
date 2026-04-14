@@ -1,16 +1,17 @@
 from django.contrib import admin
 from django.contrib.auth.admin import UserAdmin as BaseUserAdmin
-from .models import User, Category, Product, Order, OrderItem, Coupon, WishlistItem, StoreSetting, ShippingZone
+from .models import (
+    User, Category, Product, ProductVariant, ProductSize,
+    Coupon, ShippingZone, Order, OrderItem, CartItem, WishlistItem, StoreSetting
+)
 
 
 @admin.register(User)
 class UserAdmin(BaseUserAdmin):
-    fieldsets = BaseUserAdmin.fieldsets + (
-        ("بيانات إضافية", {"fields": ("phone", "address", "city", "country", "is_admin")}),
+    list_display = ["username", "email", "first_name", "last_name", "is_admin", "is_staff"]
+    fieldsets    = BaseUserAdmin.fieldsets + (
+        ("Extra", {"fields": ("phone", "address", "city", "country", "is_admin")}),
     )
-    list_display  = ["username", "email", "first_name", "last_name", "is_staff", "is_admin"]
-    list_filter   = ["is_staff", "is_admin", "is_active"]
-    search_fields = ["username", "email", "first_name", "last_name"]
 
 
 @admin.register(Category)
@@ -19,46 +20,90 @@ class CategoryAdmin(admin.ModelAdmin):
     prepopulated_fields = {"slug": ("name",)}
 
 
+# ── Product Variants (inline inside Product) ──────────────────────────────
+
+class ProductSizeInline(admin.TabularInline):
+    model  = ProductSize
+    extra  = 3
+    fields = ["size", "quantity"]
+
+
+class ProductVariantInline(admin.StackedInline):
+    model          = ProductVariant
+    extra          = 1
+    fields         = ["color", "color_hex", "image", "stock"]
+    readonly_fields = ["stock"]
+    show_change_link = True
+
+
+@admin.register(ProductVariant)
+class ProductVariantAdmin(admin.ModelAdmin):
+    list_display  = ["product", "color", "stock", "updated_at"]
+    list_filter   = ["product"]
+    search_fields = ["product__name", "color"]
+    readonly_fields = ["stock"]
+    inlines       = [ProductSizeInline]
+
+
+@admin.register(ProductSize)
+class ProductSizeAdmin(admin.ModelAdmin):
+    list_display  = ["variant", "size", "quantity"]
+    list_filter   = ["variant__product", "variant__color"]
+    search_fields = ["variant__product__name", "variant__color", "size"]
+
+
 @admin.register(Product)
 class ProductAdmin(admin.ModelAdmin):
-    list_display  = ["name", "price", "category", "in_stock", "featured", "trending", "created_at"]
+    list_display  = ["name", "category", "price", "is_available_display", "in_stock", "featured", "trending", "created_at"]
     list_filter   = ["category", "in_stock", "featured", "trending"]
     search_fields = ["name", "description"]
-    list_editable = ["in_stock", "featured", "trending"]
+    inlines       = [ProductVariantInline]
+
+    def is_available_display(self, obj):
+        return obj.is_available
+    is_available_display.short_description = "متاح للبيع"
+    is_available_display.boolean = True
+
+
+@admin.register(Coupon)
+class CouponAdmin(admin.ModelAdmin):
+    list_display = ["code", "discount", "discount_type", "uses", "max_uses", "active", "expiry"]
+    list_filter  = ["active", "discount_type"]
+
+
+@admin.register(ShippingZone)
+class ShippingZoneAdmin(admin.ModelAdmin):
+    list_display = ["governorate", "fee", "enabled", "order"]
+    list_editable = ["fee", "enabled", "order"]
+    ordering     = ["order", "governorate"]
 
 
 class OrderItemInline(admin.TabularInline):
     model  = OrderItem
     extra  = 0
-    fields = ["name", "price", "quantity", "size", "color"]
+    fields = ["product", "name", "price", "quantity", "size", "color"]
+    readonly_fields = ["line_total"]
 
 
 @admin.register(Order)
 class OrderAdmin(admin.ModelAdmin):
-    list_display  = ["__str__", "city", "total", "status", "payment_method", "created_at"]
-    list_filter   = ["status", "payment_method"]
-    search_fields = ["first_name", "last_name", "phone", "email"]
-    list_editable = ["status"]
+    list_display  = ["id", "first_name", "last_name", "phone", "city", "total", "status", "payment_method", "created_at"]
+    list_filter   = ["status", "payment_method", "city"]
+    search_fields = ["first_name", "last_name", "phone"]
     inlines       = [OrderItemInline]
-    readonly_fields = ["subtotal", "shipping_fee", "tax", "total", "discount_amount", "coupon", "created_at"]
+    readonly_fields = ["subtotal", "shipping_fee", "tax", "total", "discount_amount"]
 
 
-@admin.register(Coupon)
-class CouponAdmin(admin.ModelAdmin):
-    list_display  = ["code", "discount", "discount_type", "uses", "max_uses", "active", "expiry"]
-    list_editable = ["active"]
+@admin.register(CartItem)
+class CartItemAdmin(admin.ModelAdmin):
+    list_display = ["user", "product", "quantity", "size", "color", "added_at"]
 
 
-@admin.register(ShippingZone)
-class ShippingZoneAdmin(admin.ModelAdmin):
-    list_display  = ["governorate", "fee", "enabled", "order"]
-    list_editable = ["fee", "enabled", "order"]
-    ordering      = ["order", "governorate"]
+@admin.register(WishlistItem)
+class WishlistItemAdmin(admin.ModelAdmin):
+    list_display = ["user", "product", "added_at"]
 
 
 @admin.register(StoreSetting)
 class StoreSettingAdmin(admin.ModelAdmin):
     list_display = ["key", "value"]
-
-
-admin.site.register(WishlistItem)

@@ -1,5 +1,6 @@
 from django.contrib.auth import get_user_model
 from django.utils import timezone
+from django.db import transaction
 from django.db.models import Sum, Count, Q
 from rest_framework import generics, viewsets, status, permissions
 from rest_framework.decorators import api_view, permission_classes, action
@@ -9,12 +10,16 @@ from rest_framework_simplejwt.views import TokenObtainPairView
 from rest_framework_simplejwt.tokens import RefreshToken
 from decimal import Decimal
 
-from .models import Category, Product, Order, OrderItem, Coupon, CartItem, WishlistItem, StoreSetting, ShippingZone
+from .models import (
+    Category, Product, ProductVariant, ProductSize,
+    Order, OrderItem, Coupon, CartItem, WishlistItem, StoreSetting, ShippingZone
+)
 from .serializers import (
     RegisterSerializer, UserSerializer, UserProfileUpdateSerializer,
     CategorySerializer,
     ShippingZoneSerializer,
     ProductSerializer, ProductWriteSerializer,
+    ProductVariantSerializer,
     CouponSerializer, CouponValidateSerializer,
     OrderSerializer, OrderCreateSerializer, OrderStatusUpdateSerializer,
     CartItemSerializer, CartItemCreateUpdateSerializer,
@@ -78,7 +83,6 @@ def logout_view(request):
 class CategoryViewSet(viewsets.ModelViewSet):
     queryset         = Category.objects.all().order_by("name")
     serializer_class = CategorySerializer
-    # FIX: disable pagination for categories — frontend expects flat array
     pagination_class = None
 
     def get_permissions(self):
@@ -93,7 +97,7 @@ class CategoryViewSet(viewsets.ModelViewSet):
 class ShippingZoneViewSet(viewsets.ModelViewSet):
     queryset         = ShippingZone.objects.all()
     serializer_class = ShippingZoneSerializer
-    pagination_class = None  # always return flat list
+    pagination_class = None
 
     def get_permissions(self):
         if self.action in ["list", "retrieve"]:
@@ -101,7 +105,6 @@ class ShippingZoneViewSet(viewsets.ModelViewSet):
         return [IsAdminUser()]
 
     def list(self, request, *args, **kwargs):
-        """Public: only return enabled zones. Admin: return all."""
         qs = self.get_queryset()
         if not (request.user.is_authenticated and (request.user.is_staff or request.user.is_admin)):
             qs = qs.filter(enabled=True)
@@ -113,7 +116,14 @@ class ShippingZoneViewSet(viewsets.ModelViewSet):
 #  PRODUCTS
 # ═══════════════════════════════════════════════
 class ProductViewSet(viewsets.ModelViewSet):
-    queryset = Product.objects.select_related("category").all()
+    """
+    Products with variant-aware availability.
+
+    Public list/retrieve: only returns products that are available
+    (has at least one variant with stock > 0, or legacy in_stock=True).
+
+    Admin list/retrieve: returns all products regardless of availability.
+    """
 
     def get_serializer_class(self):
         if self.action in ["create", "update", "partial_update"]:
@@ -125,30 +135,30 @@ class ProductViewSet(viewsets.ModelViewSet):
         ctx["request"] = self.request
         return ctx
 
-    def create(self, request, *args, **kwargs):
-        serializer = self.get_serializer(data=request.data)
-        serializer.is_valid(raise_exception=True)
-        instance = serializer.save()
-        return Response(
-            ProductSerializer(instance, context={"request": request}).data,
-            status=status.HTTP_201_CREATED,
-        )
-
-    def update(self, request, *args, **kwargs):
-        partial    = kwargs.pop("partial", False)
-        instance   = self.get_object()
-        serializer = self.get_serializer(instance, data=request.data, partial=partial)
-        serializer.is_valid(raise_exception=True)
-        instance   = serializer.save()
-        return Response(ProductSerializer(instance, context={"request": request}).data)
-
     def get_permissions(self):
         if self.action in ["list", "retrieve"]:
             return [AllowAny()]
         return [IsAdminUser()]
 
     def get_queryset(self):
-        qs     = super().get_queryset()
+        user   = self.request.user
+        is_admin = user.is_authenticated and (user.is_staff or getattr(user, "is_admin", False))
+
+        qs = Product.objects.select_related("category").prefetch_related(
+            "variants", "variants__sizes"
+        )
+
+        # ── Availability filter ──────────────────────────────────────────────
+        # Public users only see products that have stock.
+        # Products with variants: at least 1 variant with stock > 0.
+        # Products without variants: use legacy in_stock flag.
+        if not is_admin:
+            # Products with variants that have stock > 0
+            has_available_variants = Q(variants__stock__gt=0)
+            # Products without variants that are in_stock
+            no_variants_in_stock   = Q(variants__isnull=True, in_stock=True)
+            qs = qs.filter(has_available_variants | no_variants_in_stock).distinct()
+
         params = self.request.query_params
 
         category = params.get("category")
@@ -183,6 +193,203 @@ class ProductViewSet(viewsets.ModelViewSet):
             qs = qs.filter(price__lte=max_price)
 
         return qs
+
+    def create(self, request, *args, **kwargs):
+        serializer = self.get_serializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        instance = serializer.save()
+        return Response(
+            ProductSerializer(instance, context={"request": request}).data,
+            status=status.HTTP_201_CREATED,
+        )
+
+    def update(self, request, *args, **kwargs):
+        partial    = kwargs.pop("partial", False)
+        instance   = self.get_object()
+        serializer = self.get_serializer(instance, data=request.data, partial=partial)
+        serializer.is_valid(raise_exception=True)
+        instance   = serializer.save()
+        return Response(ProductSerializer(instance, context={"request": request}).data)
+
+    # ── Variant sub-endpoints ──────────────────────────────────────────────
+    @action(
+        detail=True, methods=["get"],
+        url_path="variants", permission_classes=[AllowAny]
+    )
+    def variants(self, request, pk=None):
+        """
+        GET /products/<id>/variants/
+        
+        Returns all color variants for a product, each with its sizes and stock info.
+        
+        RESPONSE EXAMPLE:
+        [
+            {
+                "id": 1,
+                "color": "أسود",
+                "color_hex": "#000000",
+                "image": "http://localhost:8000/media/products/variants/black.jpg",
+                "total_stock": 12,
+                "sizes": [
+                    {"id": 1, "size": "S", "quantity": 5},
+                    {"id": 2, "size": "M", "quantity": 7}
+                ]
+            }
+        ]
+        
+        BEHAVIOR:
+        - Public users: only see variants with stock > 0
+        - Admins: see all variants including out-of-stock ones
+        """
+        product  = self.get_object()
+        user     = request.user
+        is_admin = user.is_authenticated and (user.is_staff or getattr(user, "is_admin", False))
+
+        qs = product.variants.prefetch_related("sizes")
+        if not is_admin:
+            qs = qs.filter(stock__gt=0)
+
+        return Response(
+            ProductVariantSerializer(qs, many=True, context={"request": request}).data
+        )
+
+    @action(
+        detail=True, methods=["post", "put", "patch"],
+        url_path="variants/update", permission_classes=[IsAdminUser]
+    )
+    def update_variants(self, request, pk=None):
+        """
+        POST/PUT /products/<id>/variants/update/
+        
+        Add or update all color variants for a product (admin only).
+        This REPLACES all existing variants with the new data.
+        
+        REQUEST BODY (application/json):
+        {
+            "variants": [
+                {
+                    "color": "أسود",
+                    "color_hex": "#000000",
+                    "image": "http://example.com/black.jpg",
+                    "sizes": [
+                        {"size": "S", "quantity": 5},
+                        {"size": "M", "quantity": 10},
+                        {"size": "L", "quantity": 0}
+                    ]
+                },
+                {
+                    "color": "أبيض",
+                    "color_hex": "#FFFFFF",
+                    "image": "http://example.com/white.jpg",
+                    "sizes": [
+                        {"size": "S", "quantity": 3},
+                        {"size": "M", "quantity": 8}
+                    ]
+                }
+            ]
+        }
+        
+        RESPONSE: Updated product with new variants
+        
+        NOTES:
+        - Duplicates by color are automatically skipped
+        - Variant totals (stock) are recalculated automatically
+        - Product availability is updated in real-time
+        - Size quantity can be 0 (counts as out-of-stock for that size)
+        """
+        product = self.get_object()
+        variants_data = request.data.get("variants", [])
+
+        import json
+        if isinstance(variants_data, str):
+            try:
+                variants_data = json.loads(variants_data)
+            except Exception:
+                variants_data = []
+
+        write_ser = ProductWriteSerializer(context={"request": request})
+        write_ser._handle_variants(product, json.dumps(variants_data), request)
+
+        return Response(
+            ProductSerializer(product, context={"request": request}).data
+        )
+
+    @action(
+        detail=True, methods=["get"],
+        url_path="stock", permission_classes=[AllowAny]
+    )
+    def stock(self, request, pk=None):
+        """
+        GET /products/<id>/stock/
+        
+        Detailed stock breakdown by color and size.
+        Useful for showing "Only 3 left in stock!" style messages on frontend.
+        
+        RESPONSE EXAMPLE:
+        {
+            "product_id": 1,
+            "product_name": "T-Shirt",
+            "is_available": true,
+            "colors": [
+                {
+                    "color": "أسود",
+                    "color_hex": "#000000",
+                    "image": "http://localhost:8000/media/products/variants/black.jpg",
+                    "stock": 12,
+                    "sizes": [
+                        {"size": "S", "quantity": 5},
+                        {"size": "M", "quantity": 7},
+                        {"size": "L", "quantity": 0}
+                    ]
+                },
+                {
+                    "color": "أبيض",
+                    "color_hex": "#FFFFFF",
+                    "image": "http://localhost:8000/media/products/variants/white.jpg",
+                    "stock": 8,
+                    "sizes": [
+                        {"size": "S", "quantity": 3},
+                        {"size": "M", "quantity": 5}
+                    ]
+                }
+            ]
+        }
+        
+        BEHAVIOR:
+        - Public users: only see colors/sizes with quantity > 0
+        - Admins: see all colors/sizes including zero quantities
+        """
+        product  = self.get_object()
+        user     = request.user
+        is_admin = user.is_authenticated and (user.is_staff or getattr(user, "is_admin", False))
+
+        qs = product.variants.prefetch_related("sizes").all()
+        if not is_admin:
+            qs = qs.filter(stock__gt=0)
+
+        result = []
+        for variant in qs:
+            sizes = []
+            for ps in variant.sizes.all():
+                if is_admin or ps.quantity > 0:
+                    sizes.append({
+                        "size":     ps.size,
+                        "quantity": ps.quantity,
+                    })
+            result.append({
+                "color":     variant.color,
+                "color_hex": variant.color_hex,
+                "image":     variant.image,
+                "stock":     variant.stock,
+                "sizes":     sizes,
+            })
+
+        return Response({
+            "product_id":   product.id,
+            "product_name": product.name,
+            "is_available": product.is_available,
+            "colors":       result,
+        })
 
 
 # ═══════════════════════════════════════════════
@@ -231,6 +438,59 @@ class CouponViewSet(viewsets.ModelViewSet):
 # ═══════════════════════════════════════════════
 #  ORDERS
 # ═══════════════════════════════════════════════
+def _deduct_stock_for_order(order_items_data):
+    """
+    For each order item that specifies a color and size, find the
+    corresponding ProductSize record and reduce its quantity.
+
+    This is called inside a database transaction so if anything fails
+    the whole order is rolled back.
+
+    Returns a list of errors (empty list = all good).
+    """
+    errors = []
+    for item in order_items_data:
+        product_id = item.get("product_id")
+        color      = (item.get("color") or "").strip()
+        size       = (item.get("size") or "").strip()
+        qty        = int(item.get("quantity", 1))
+
+        if not color or not size:
+            # No variant info → skip stock deduction (legacy product)
+            continue
+
+        try:
+            product = Product.objects.get(pk=product_id)
+        except Product.DoesNotExist:
+            continue
+
+        if not product.has_variants:
+            continue
+
+        try:
+            variant = product.variants.get(color__iexact=color)
+        except ProductVariant.DoesNotExist:
+            errors.append(
+                f"اللون '{color}' غير متوفر للمنتج '{product.name}'"
+            )
+            continue
+
+        try:
+            psize = variant.sizes.get(size__iexact=size)
+        except ProductSize.DoesNotExist:
+            errors.append(
+                f"المقاس '{size}' غير متوفر للون '{color}' من منتج '{product.name}'"
+            )
+            continue
+
+        try:
+            psize.reduce_stock(qty)
+        except ValueError as e:
+            errors.append(str(e))
+
+    return errors
+
+
 class OrderViewSet(viewsets.ModelViewSet):
     serializer_class = OrderSerializer
 
@@ -245,7 +505,7 @@ class OrderViewSet(viewsets.ModelViewSet):
         user = self.request.user
         if not user.is_authenticated:
             return Order.objects.none()
-        if user.is_staff or user.is_admin:
+        if user.is_staff or getattr(user, "is_admin", False):
             qs = Order.objects.all().prefetch_related("items")
             s  = self.request.query_params.get("status")
             if s:
@@ -259,12 +519,22 @@ class OrderViewSet(viewsets.ModelViewSet):
             return qs.order_by("-created_at")
         return Order.objects.filter(user=user).prefetch_related("items").order_by("-created_at")
 
+    @transaction.atomic
     def create(self, request, *args, **kwargs):
         s = OrderCreateSerializer(data=request.data)
         s.is_valid(raise_exception=True)
         data = s.validated_data
 
-        # ── Coupon ────────────────────────────────
+        # ── Stock validation & deduction ──────────────────────────────────
+        # Done first, inside a transaction, so any stock error prevents order creation.
+        stock_errors = _deduct_stock_for_order(data["items"])
+        if stock_errors:
+            return Response(
+                {"detail": "خطأ في المخزون", "errors": stock_errors},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        # ── Coupon ────────────────────────────────────────────────────────
         coupon          = None
         discount_amount = Decimal("0")
         coupon_code     = data.get("coupon_code", "").upper()
@@ -274,30 +544,27 @@ class OrderViewSet(viewsets.ModelViewSet):
             except Coupon.DoesNotExist:
                 pass
 
-        # ── Subtotal ──────────────────────────────
+        # ── Subtotal ──────────────────────────────────────────────────────
         subtotal = sum(
             Decimal(str(item["price"])) * item["quantity"]
             for item in data["items"]
         )
 
-        # ── Shipping fee — use value from frontend (derived from ShippingZone) ──
-        # If frontend sent a shipping_fee, trust it; otherwise look up by city.
+        # ── Shipping fee ──────────────────────────────────────────────────
         frontend_fee = data.get("shipping_fee")
         if frontend_fee and frontend_fee > 0:
             shipping_fee = frontend_fee
         else:
-            # Fallback: look up shipping zone by city
             try:
                 zone         = ShippingZone.objects.get(governorate=data["city"], enabled=True)
                 shipping_fee = zone.fee
             except ShippingZone.DoesNotExist:
-                shipping_fee = Decimal("80")  # default if zone not found
+                shipping_fee = Decimal("80")
 
-        # Free shipping above 1000 EGP
         if subtotal >= Decimal("1000"):
             shipping_fee = Decimal("0")
 
-        tax = Decimal("0")  # no tax for now
+        tax = Decimal("0")
 
         if coupon:
             if coupon.discount_type == "percent":
@@ -382,13 +649,6 @@ class OrderViewSet(viewsets.ModelViewSet):
 #  CART
 # ═══════════════════════════════════════════════
 class CartItemViewSet(viewsets.ModelViewSet):
-    """
-    Cart management:
-    - GET /cart/              → List user's cart items
-    - POST /cart/             → Add item to cart
-    - PATCH /cart/:id/        → Update item quantity/size/color
-    - DELETE /cart/:id/       → Remove item from cart
-    """
     permission_classes = [IsAuthenticated]
     serializer_class    = CartItemSerializer
 
@@ -408,7 +668,6 @@ class CartItemViewSet(viewsets.ModelViewSet):
 
     @action(detail=False, methods=["get"])
     def total(self, request):
-        """Get cart total and item count"""
         items = CartItem.objects.filter(user=request.user)
         total = sum(float(item.product.price) * item.quantity for item in items)
         return Response({
@@ -419,7 +678,6 @@ class CartItemViewSet(viewsets.ModelViewSet):
 
     @action(detail=False, methods=["delete"])
     def clear(self, request):
-        """Clear user's entire cart"""
         CartItem.objects.filter(user=request.user).delete()
         return Response({"detail": "تم تفريغ السلة"})
 
